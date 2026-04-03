@@ -187,9 +187,75 @@ def validate_reference_columns(df: pd.DataFrame) -> None:
 
 def validate_logs_columns(df: pd.DataFrame) -> None:
     cols = {normalize_text(c) for c in df.columns}
+
+    # Standard logs
+    if "triggerOrContext" in cols and "message" in cols:
+        return
+
+    # DBB logs: we accept them if message exists, because triggerOrContext
+    # can be extracted from the JSON payload.
+    if "message" in cols:
+        return
+
     missing = [c for c in LOGS_REQUIRED if normalize_text(c) not in cols]
-    if missing:
-        raise ValueError(f"Logs file is missing required columns: {missing}")
+    raise ValueError(f"Logs file is missing required columns: {missing}")
+
+
+def _extract_trigger_from_message(raw_message: Any) -> str:
+    """
+    Extract trigger from DBB-style JSON message payload.
+    Priority:
+      1. context.triggerOrContext
+      2. data.trigger
+      3. data.standardTrigger
+      4. root.triggerOrContext
+    """
+    if not isinstance(raw_message, str) or not raw_message.strip():
+        return ""
+
+    try:
+        payload = json.loads(raw_message)
+    except Exception:
+        return ""
+
+    context = payload.get("context", {})
+    data = payload.get("data", {})
+
+    trigger_value = ""
+
+    if isinstance(context, dict):
+        trigger_value = context.get("triggerOrContext", "") or ""
+
+    if not trigger_value and isinstance(data, dict):
+        trigger_value = data.get("trigger", "") or ""
+
+    if not trigger_value and isinstance(data, dict):
+        trigger_value = data.get("standardTrigger", "") or ""
+
+    if not trigger_value:
+        trigger_value = payload.get("triggerOrContext", "") or ""
+
+    return normalize_text(trigger_value)
+
+
+def enrich_dbb_logs_if_needed(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Supports DBB-style logs where triggerOrContext is embedded in JSON inside `message`.
+    If `triggerOrContext` already exists, the dataframe is returned normalized only.
+    """
+    df = df.copy()
+    df = df.rename(columns=lambda x: normalize_text(x))
+
+    if "message" not in df.columns:
+        return df
+
+    if "triggerOrContext" in df.columns:
+        df["triggerOrContext"] = df["triggerOrContext"].astype(str).map(normalize_text)
+        return df
+
+    extracted_triggers = [_extract_trigger_from_message(raw_message) for raw_message in df["message"]]
+    df["triggerOrContext"] = extracted_triggers
+    return df
 
 
 def load_reference_file(path: str) -> pd.DataFrame:
@@ -201,7 +267,18 @@ def load_reference_file(path: str) -> pd.DataFrame:
 def load_logs_file(path: str) -> pd.DataFrame:
     df = read_table(path)
     validate_logs_columns(df)
-    return df.rename(columns=lambda x: normalize_text(x))
+
+    df = df.rename(columns=lambda x: normalize_text(x))
+    df = enrich_dbb_logs_if_needed(df)
+
+    cols = {normalize_text(c) for c in df.columns}
+    if "triggerOrContext" not in cols or "message" not in cols:
+        raise ValueError(
+            "Logs file could not be normalized. Required columns after normalization: "
+            "triggerOrContext, message"
+        )
+
+    return df
 
 
 def create_preview_text(reference_df: Optional[pd.DataFrame], logs_df: Optional[pd.DataFrame]) -> str:
@@ -215,10 +292,20 @@ def create_preview_text(reference_df: Optional[pd.DataFrame], logs_df: Optional[
         lines.append("")
 
     if logs_df is not None:
-        lines.append("=== LOGS (UU) ===")
+        lines.append("=== LOGS ===")
         lines.append(f"Rows: {len(logs_df)}")
         lines.append(f"Columns: {list(logs_df.columns)}")
         lines.append(logs_df.head(5).to_string(index=False))
+
+        extracted = 0
+        if "triggerOrContext" in logs_df.columns:
+            try:
+                extracted = int((logs_df["triggerOrContext"].astype(str).str.strip() != "").sum())
+            except Exception:
+                extracted = 0
+
+        lines.append("")
+        lines.append(f"Rows with extracted triggerOrContext: {extracted}")
         lines.append("")
 
     if reference_df is None and logs_df is None:
@@ -257,6 +344,8 @@ def run_signal_check(
         log_callback("Initializing analysis engine...")
         log_callback(f"Reference rows eligible for processing: {total}")
         log_callback(f"Log rows loaded: {len(logs_df)}")
+        extracted = int((logs_df["triggerOrContext"].astype(str).str.strip() != "").sum())
+        log_callback(f"Rows with usable triggerOrContext: {extracted}")
 
     for idx, (_, ref_row) in enumerate(reference_df.iterrows(), start=1):
         trigger = normalize_text(ref_row["Report event"])
@@ -380,6 +469,10 @@ def write_output(
                 {"Field": "Values", "Value": "Values Seen contains all extracted values in occurrence order."},
                 {"Field": "Null rule", "Value": "0 is valid. None, empty string, EMPTY, NaN, [null], [] are treated as null/empty."},
                 {"Field": "Status", "Value": "FOUND / SIGNAL NOT FOUND / TRIGGER NOT FOUND."},
+                {
+                    "Field": "DBB support",
+                    "Value": "If triggerOrContext column is missing, it is extracted automatically from JSON message payload (context.triggerOrContext, data.trigger, data.standardTrigger).",
+                },
             ]
         )
         readme.to_excel(writer, index=False, sheet_name="Read Me")
