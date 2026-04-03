@@ -20,3 +20,7 @@ A Python-based GUI application for analyzing log files against reference files.
    pip install -r requirements.txt
 3. Run:
    python signal_checker_gui.py
+
+
+## Update
+Added support for DBB Logs
