@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -11,7 +12,16 @@ import pandas as pd
 
 DEFAULT_OUTPUT_NAME = "signal_check_results.xlsx"
 
-REFERENCE_REQUIRED = ["Signal long name", "Signal short name", "Report event"]
+SIGNAL_LONG_COLUMN = "Signal long name"
+SIGNAL_SHORT_COLUMN = "Signal short name"
+SIGNAL_NAME_COLUMN = "Signal name"
+
+# Internal canonical name used by the engine.
+# The app now accepts either "Report event" or "Upload condition" in the reference file.
+TRIGGER_COLUMN = "Report event"
+REFERENCE_TRIGGER_ALIASES = ["Report event", "Upload condition"]
+
+REFERENCE_REQUIRED_BASE = [SIGNAL_LONG_COLUMN, SIGNAL_SHORT_COLUMN]
 LOGS_REQUIRED = ["triggerOrContext", "message"]
 
 # Important: 0 is a valid value, not empty.
@@ -24,6 +34,7 @@ class CheckConfig:
     logs_path: str
     output_path: str
     export_debug: bool = True
+    custom_path: Optional[str] = None
 
 
 def read_table(file_path: str) -> pd.DataFrame:
@@ -47,6 +58,73 @@ def normalize_text(value: Any) -> str:
 
 def canonical_key(value: Any) -> str:
     return re.sub(r"[^a-z0-9]", "", normalize_text(value).lower())
+
+
+def _normalized_columns(df: pd.DataFrame) -> list[str]:
+    return [normalize_text(c) for c in df.columns]
+
+
+def _find_column_name(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
+    """
+    Finds a column by exact normalized name first, then by canonical name.
+    This allows small variations like extra spaces/case differences.
+    """
+    normalized_map = {normalize_text(c): c for c in df.columns}
+
+    for candidate in candidates:
+        candidate_norm = normalize_text(candidate)
+        if candidate_norm in normalized_map:
+            return normalized_map[candidate_norm]
+
+    canonical_map = {canonical_key(c): c for c in df.columns}
+    for candidate in candidates:
+        candidate_key = canonical_key(candidate)
+        if candidate_key in canonical_map:
+            return canonical_map[candidate_key]
+
+    return None
+
+
+def _get_reference_trigger_source(df: pd.DataFrame) -> Optional[str]:
+    return _find_column_name(df, REFERENCE_TRIGGER_ALIASES)
+
+
+def normalize_reference_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalizes reference files to the internal schema expected by the engine.
+
+    Supported reference trigger columns:
+      - Report event
+      - Upload condition
+
+    Internally both are mapped to:
+      - Report event
+
+    If both columns exist, "Report event" stays the primary source and empty
+    values are filled from "Upload condition".
+    """
+    df = df.copy()
+    df = df.rename(columns=lambda x: normalize_text(x))
+
+    trigger_source = _get_reference_trigger_source(df)
+    if trigger_source is None:
+        return df
+
+    trigger_source = normalize_text(trigger_source)
+
+    if TRIGGER_COLUMN not in df.columns:
+        df[TRIGGER_COLUMN] = df[trigger_source]
+    elif trigger_source != TRIGGER_COLUMN and trigger_source in df.columns:
+        # Keep Report event as the official engine column, but fill blanks from Upload condition.
+        report_values = df[TRIGGER_COLUMN].fillna("").astype(str).map(normalize_text)
+        fallback_values = df[trigger_source].fillna("").astype(str).map(normalize_text)
+        df[TRIGGER_COLUMN] = report_values.where(report_values != "", fallback_values)
+
+    # Keep a helper column for traceability in preview/debug if the reference used Upload condition.
+    if trigger_source != TRIGGER_COLUMN:
+        df["Reference trigger source"] = trigger_source
+
+    return df
 
 
 def is_null_like(value: Any) -> bool:
@@ -179,10 +257,24 @@ def find_signal_in_message(
 
 
 def validate_reference_columns(df: pd.DataFrame) -> None:
-    cols = {normalize_text(c) for c in df.columns}
-    missing = [c for c in REFERENCE_REQUIRED if normalize_text(c) not in cols]
-    if missing:
-        raise ValueError(f"Reference file is missing required columns: {missing}")
+    df = df.rename(columns=lambda x: normalize_text(x))
+
+    missing_base = [
+        required for required in REFERENCE_REQUIRED_BASE
+        if _find_column_name(df, [required]) is None
+    ]
+
+    trigger_source = _get_reference_trigger_source(df)
+
+    errors: list[str] = []
+    if missing_base:
+        errors.extend(missing_base)
+
+    if trigger_source is None:
+        errors.append("Report event OR Upload condition")
+
+    if errors:
+        raise ValueError(f"Reference file is missing required columns: {errors}")
 
 
 def validate_logs_columns(df: pd.DataFrame) -> None:
@@ -261,7 +353,13 @@ def enrich_dbb_logs_if_needed(df: pd.DataFrame) -> pd.DataFrame:
 def load_reference_file(path: str) -> pd.DataFrame:
     df = read_table(path)
     validate_reference_columns(df)
-    return df.rename(columns=lambda x: normalize_text(x))
+    df = normalize_reference_dataframe(df)
+
+    # Final guard: downstream/UI code expects Report event.
+    if TRIGGER_COLUMN not in df.columns:
+        raise ValueError("Reference file could not be normalized. Required trigger column: Report event or Upload condition.")
+
+    return df
 
 
 def load_logs_file(path: str) -> pd.DataFrame:
@@ -285,9 +383,37 @@ def create_preview_text(reference_df: Optional[pd.DataFrame], logs_df: Optional[
     lines: list[str] = []
 
     if reference_df is not None:
+        reference_df = normalize_reference_dataframe(reference_df)
+
         lines.append("=== REFERENCE (CCS) ===")
         lines.append(f"Rows: {len(reference_df)}")
         lines.append(f"Columns: {list(reference_df.columns)}")
+
+        trigger_source = "Report event"
+        if "Reference trigger source" in reference_df.columns:
+            try:
+                sources = sorted(
+                    set(
+                        str(v).strip()
+                        for v in reference_df["Reference trigger source"].dropna().tolist()
+                        if str(v).strip()
+                    )
+                )
+                if sources:
+                    trigger_source = " / ".join(sources)
+            except Exception:
+                trigger_source = "Report event"
+
+        trigger_count = 0
+        if TRIGGER_COLUMN in reference_df.columns:
+            try:
+                trigger_count = int((reference_df[TRIGGER_COLUMN].astype(str).str.strip() != "").sum())
+            except Exception:
+                trigger_count = 0
+
+        lines.append(f"Reference trigger column used by engine: {TRIGGER_COLUMN}")
+        lines.append(f"Original trigger source: {trigger_source}")
+        lines.append(f"Rows with usable trigger: {trigger_count}")
         lines.append(reference_df.head(8).to_string(index=False))
         lines.append("")
 
@@ -314,6 +440,281 @@ def create_preview_text(reference_df: Optional[pd.DataFrame], logs_df: Optional[
     return "\n".join(lines)
 
 
+
+
+# ----------------------------------------------------------------------
+# Custom applicability support
+# ----------------------------------------------------------------------
+def _split_custom_name(raw_name: Any) -> dict[str, str]:
+    """
+    Custom applicability entries are encoded as:
+      shortName;trigger;customSetting;uid;freshness;privacy
+
+    The first field is always the signal short name. The trigger and the
+    remaining fields are kept for traceability, but the applicability key is
+    the short name.
+    """
+    raw = normalize_text(raw_name)
+    parts = [normalize_text(part) for part in raw.split(";")]
+    while len(parts) < 6:
+        parts.append("")
+
+    return {
+        "Custom Raw Name": raw,
+        "Custom Signal short name": parts[0],
+        "Custom Trigger": parts[1],
+        "Custom Setting": parts[2],
+        "Custom UID": parts[3],
+        "Custom Freshness": parts[4],
+        "Custom Privacy": parts[5],
+    }
+
+
+def _load_custom_xml(path: str) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    tree = ET.parse(path)
+    root = tree.getroot()
+
+    custom_setting_name = normalize_text(root.attrib.get("Name", ""))
+    ecu = normalize_text(root.attrib.get("ECU", ""))
+    action_type = normalize_text(root.attrib.get("ActionType", ""))
+    method = normalize_text(root.attrib.get("Method", ""))
+    status = normalize_text(root.attrib.get("status", ""))
+
+    for prop in root.findall(".//property"):
+        parsed = _split_custom_name(prop.attrib.get("Name", ""))
+        if not parsed["Custom Signal short name"]:
+            continue
+
+        parsed.update(
+            {
+                "Custom Value": normalize_text(prop.attrib.get("value", "")),
+                "Custom Type": normalize_text(prop.attrib.get("Type", "")),
+                "Custom Root Setting": custom_setting_name,
+                "Custom ECU": ecu,
+                "Custom ActionType": action_type,
+                "Custom Method": method,
+                "Custom Root Status": status,
+                "Custom Source Type": "XML",
+                "Custom Source File": Path(path).name,
+            }
+        )
+        rows.append(parsed)
+
+    return pd.DataFrame(rows)
+
+
+def _load_custom_csv(path: str) -> pd.DataFrame:
+    df = read_table(path).rename(columns=lambda x: normalize_text(x))
+    rows: list[dict[str, Any]] = []
+
+    # Preferred format: a Name column containing the semicolon-encoded value.
+    name_col = _find_column_name(df, ["Name", "property Name", "Custom Name", "Property Name"])
+
+    # Alternative format: direct columns already split in the CSV.
+    short_col = _find_column_name(df, ["Signal short name", "Short Name", "ShortName", "Signal Short Name", "Custom Signal short name"])
+    trigger_col = _find_column_name(df, ["Trigger", "Report event", "Upload condition", "Custom Trigger"])
+    setting_col = _find_column_name(df, ["Custom Setting", "Setting", "CustomSetting", "Custom Root Setting"])
+    uid_col = _find_column_name(df, ["UID", "Custom UID"])
+    freshness_col = _find_column_name(df, ["Freshness", "Custom Freshness"])
+    privacy_col = _find_column_name(df, ["Privacy", "Custom Privacy"])
+    value_col = _find_column_name(df, ["value", "Value", "Custom Value"])
+
+    # If no explicit Name column exists, search for the first column with semicolon-encoded values.
+    if name_col is None:
+        for col in df.columns:
+            sample = df[col].dropna().astype(str).head(20).tolist()
+            if any(";" in item for item in sample):
+                name_col = col
+                break
+
+    for _, row in df.fillna("").iterrows():
+        if name_col is not None and normalize_text(row.get(name_col, "")):
+            parsed = _split_custom_name(row.get(name_col, ""))
+        else:
+            short_name = normalize_text(row.get(short_col, "")) if short_col else ""
+            if not short_name:
+                continue
+            raw_name = ";".join(
+                [
+                    short_name,
+                    normalize_text(row.get(trigger_col, "")) if trigger_col else "",
+                    normalize_text(row.get(setting_col, "")) if setting_col else "",
+                    normalize_text(row.get(uid_col, "")) if uid_col else "",
+                    normalize_text(row.get(freshness_col, "")) if freshness_col else "",
+                    normalize_text(row.get(privacy_col, "")) if privacy_col else "",
+                ]
+            )
+            parsed = _split_custom_name(raw_name)
+
+        if not parsed["Custom Signal short name"]:
+            continue
+
+        parsed.update(
+            {
+                "Custom Value": normalize_text(row.get(value_col, "")) if value_col else "",
+                "Custom Type": "",
+                "Custom Root Setting": normalize_text(row.get(setting_col, "")) if setting_col else parsed.get("Custom Setting", ""),
+                "Custom ECU": "",
+                "Custom ActionType": "",
+                "Custom Method": "",
+                "Custom Root Status": "",
+                "Custom Source Type": "CSV",
+                "Custom Source File": Path(path).name,
+            }
+        )
+        rows.append(parsed)
+
+    return pd.DataFrame(rows)
+
+
+def load_custom_file(path: str) -> pd.DataFrame:
+    suffix = Path(path).suffix.lower()
+    if suffix == ".xml":
+        return _load_custom_xml(path)
+    if suffix in {".csv", ".tsv", ".xlsx", ".xls", ".xlsm"}:
+        return _load_custom_csv(path)
+    raise ValueError(f"Unsupported custom applicability file type: {suffix}")
+
+
+def _best_summary_row(
+    summary_rows: list[dict[str, Any]],
+    custom_trigger: str = "",
+) -> dict[str, Any] | None:
+    """
+    Choose the best Summary row for one Custom applicability entry.
+
+    Custom is the applicability reference, so the Custom row is never rejected
+    because of trigger. However, when the same short name exists in Summary with
+    the same trigger as the Custom row, that Summary row is preferred for clearer
+    traceability. If no same-trigger Summary row exists, the function falls back
+    to the best row by status/occurrences.
+    """
+    if not summary_rows:
+        return None
+
+    custom_trigger_key = canonical_key(custom_trigger)
+
+    def priority(row: dict[str, Any]) -> tuple[int, int, int, int]:
+        status = normalize_text(row.get("Status", ""))
+        signal_occ = int(row.get("Signal Occurrences", 0) or 0)
+        trigger_occ = int(row.get("Trigger Occurrences", 0) or 0)
+        summary_trigger_key = canonical_key(row.get("Trigger", ""))
+
+        # Prefer the same trigger when available, but do not require it.
+        trigger_match_penalty = 0 if custom_trigger_key and summary_trigger_key == custom_trigger_key else 1
+
+        if status == "FOUND":
+            status_rank = 0
+        elif status == "SIGNAL NOT FOUND":
+            status_rank = 1
+        elif status == "TRIGGER NOT FOUND":
+            status_rank = 2
+        else:
+            status_rank = 3
+
+        return (trigger_match_penalty, status_rank, -signal_occ, -trigger_occ)
+
+    return sorted(summary_rows, key=priority)[0]
+
+
+def build_custom_applicability_sheet(
+    custom_df: pd.DataFrame,
+    summary_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Build the Custom Applicability sheet using Custom XML/CSV as the reference.
+
+    Agreed logic:
+      - Custom.xml / Custom.csv = applicability reference for the exact car.
+      - CCS_Parameters = main base/reference where signal metadata is found.
+      - Logs.csv / 323.csv = what was performed on vehicle.
+
+    For every Custom entry, use the first field before ';' as Signal Short Name.
+    Match that short name to Summary[Signal short name]. The Custom trigger is
+    shown and used only to choose the clearest Summary row when available; it is
+    not used to reject applicability.
+    """
+    if custom_df is None or custom_df.empty:
+        return pd.DataFrame()
+
+    summary = summary_df.copy().fillna("")
+    custom = custom_df.copy().fillna("")
+
+    if "Signal short name" not in summary.columns:
+        summary["Signal short name"] = ""
+
+    summary["_short_key"] = summary["Signal short name"].astype(str).map(canonical_key)
+    custom["_short_key"] = custom["Custom Signal short name"].astype(str).map(canonical_key)
+
+    summary_by_short: dict[str, list[dict[str, Any]]] = {}
+    for _, row in summary.iterrows():
+        key = row.get("_short_key", "")
+        if key:
+            summary_by_short.setdefault(key, []).append(row.to_dict())
+
+    out_rows: list[dict[str, Any]] = []
+
+    for _, custom_row in custom.iterrows():
+        short_key = custom_row.get("_short_key", "")
+        custom_trigger = normalize_text(custom_row.get("Custom Trigger", ""))
+        summary_rows = summary_by_short.get(short_key, [])
+        best = _best_summary_row(summary_rows, custom_trigger=custom_trigger)
+
+        if best is None:
+            summary_status = ""
+            result_status = "CUSTOM SIGNAL APPLICABLE BUT NOT FOUND IN CCS SUMMARY"
+            best = {}
+        else:
+            summary_status = normalize_text(best.get("Status", ""))
+
+            if summary_status == "FOUND":
+                result_status = "PRESENT IN SUMMARY AND APPLICABLE IN CUSTOM.XML"
+            elif summary_status == "SIGNAL NOT FOUND":
+                result_status = "SIGNAL NOT PRESENT IN SUMMARY AND APPLICABLE IN CUSTOM.XML"
+            elif summary_status == "TRIGGER NOT FOUND":
+                result_status = "TRIGGER NOT PRESENT IN SUMMARY BUT APPLICABLE IN CUSTOM.XML"
+            else:
+                result_status = "CUSTOM SIGNAL APPLICABLE BUT SUMMARY STATUS UNKNOWN"
+
+        custom_short = custom_row.get("Custom Signal short name", "")
+        summary_trigger = best.get("Trigger", "")
+        summary_signal_short = best.get("Signal short name", custom_short)
+
+        out_rows.append(
+            {
+                # Put the important business status early so it is easy to see in Excel.
+                "Status": result_status,
+                "Custom Applicability Status": result_status,
+                "Custom Signal short name": custom_short,
+                "Custom Trigger": custom_trigger,
+                "Custom Setting": custom_row.get("Custom Setting", ""),
+                "Custom UID": custom_row.get("Custom UID", ""),
+                "Custom Freshness": custom_row.get("Custom Freshness", ""),
+                "Custom Privacy": custom_row.get("Custom Privacy", ""),
+                "Custom Value": custom_row.get("Custom Value", ""),
+                "Custom Source Type": custom_row.get("Custom Source Type", ""),
+                "Custom Source File": custom_row.get("Custom Source File", ""),
+                "Custom Raw Name": custom_row.get("Custom Raw Name", ""),
+                "Summary Trigger": summary_trigger,
+                "Signal long name": best.get("Signal long name", ""),
+                "Signal short name": summary_signal_short,
+                "Signal name": best.get("Signal name", ""),
+                "Trigger Occurrences": best.get("Trigger Occurrences", ""),
+                "Signal Occurrences": best.get("Signal Occurrences", ""),
+                "Null/Empty Occurrences": best.get("Null/Empty Occurrences", ""),
+                "Present in Logs": best.get("Present in Logs", "NO"),
+                "Matched Key(s)": best.get("Matched Key(s)", ""),
+                "Match Strategy": best.get("Match Strategy", ""),
+                "Values Seen": best.get("Values Seen", ""),
+                "Summary Status": summary_status,
+                "Custom Logic": "Custom file is the car applicability reference. Every Custom row is exported. Matching to CCS/Summary is by Signal short name. Custom trigger is kept for traceability and only used to prefer the same Summary trigger when available; it never rejects applicability.",
+            }
+        )
+
+    return pd.DataFrame(out_rows)
+
+
 def run_signal_check(
     reference_df: pd.DataFrame,
     logs_df: pd.DataFrame,
@@ -321,15 +722,18 @@ def run_signal_check(
     progress_callback: Optional[Callable[[str], None]] = None,
     log_callback: Optional[Callable[[str], None]] = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    reference_df = reference_df.copy()
+    reference_df = normalize_reference_dataframe(reference_df.copy())
     logs_df = logs_df.copy()
 
     reference_df = reference_df.fillna("")
     logs_df = logs_df.fillna("")
 
+    if TRIGGER_COLUMN not in reference_df.columns:
+        raise ValueError("Reference file must contain either 'Report event' or 'Upload condition'.")
+
     reference_df = reference_df[
-        (reference_df["Report event"].astype(str).str.strip() != "")
-        & (reference_df["Signal long name"].astype(str).str.strip() != "")
+        (reference_df[TRIGGER_COLUMN].astype(str).str.strip() != "")
+        & (reference_df[SIGNAL_LONG_COLUMN].astype(str).str.strip() != "")
     ].copy()
 
     logs_df["triggerOrContext"] = logs_df["triggerOrContext"].astype(str).map(normalize_text)
@@ -348,10 +752,10 @@ def run_signal_check(
         log_callback(f"Rows with usable triggerOrContext: {extracted}")
 
     for idx, (_, ref_row) in enumerate(reference_df.iterrows(), start=1):
-        trigger = normalize_text(ref_row["Report event"])
-        signal_long = normalize_text(ref_row["Signal long name"])
-        signal_short = normalize_text(ref_row.get("Signal short name", ""))
-        signal_name = normalize_text(ref_row.get("Signal name", ""))
+        trigger = normalize_text(ref_row[TRIGGER_COLUMN])
+        signal_long = normalize_text(ref_row[SIGNAL_LONG_COLUMN])
+        signal_short = normalize_text(ref_row.get(SIGNAL_SHORT_COLUMN, ""))
+        signal_name = normalize_text(ref_row.get(SIGNAL_NAME_COLUMN, ""))
 
         if progress_callback:
             progress_callback(f"Processing {idx}/{total}: {signal_long}")
@@ -432,7 +836,17 @@ def run_signal_check(
     summary_df = pd.DataFrame(summary_rows)
     debug_df = pd.DataFrame(debug_rows)
 
-    write_output(Path(config.output_path), summary_df, debug_df, config.export_debug)
+    custom_applicability_df: Optional[pd.DataFrame] = None
+    custom_path = normalize_text(getattr(config, "custom_path", ""))
+    if custom_path:
+        if log_callback:
+            log_callback(f"Loading Custom applicability reference: {custom_path}")
+        custom_df = load_custom_file(custom_path)
+        custom_applicability_df = build_custom_applicability_sheet(custom_df, summary_df)
+        if log_callback:
+            log_callback(f"Custom applicability rows: {len(custom_applicability_df)}")
+
+    write_output(Path(config.output_path), summary_df, debug_df, config.export_debug, custom_applicability_df)
 
     if log_callback:
         log_callback("Analysis completed.")
@@ -449,6 +863,7 @@ def write_output(
     summary_df: pd.DataFrame,
     debug_df: pd.DataFrame,
     export_debug: bool,
+    custom_applicability_df: Optional[pd.DataFrame] = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -458,9 +873,19 @@ def write_output(
         if export_debug:
             debug_df.to_excel(writer, index=False, sheet_name="Debug")
 
+        if custom_applicability_df is not None and not custom_applicability_df.empty:
+            custom_applicability_df.to_excel(writer, index=False, sheet_name="Custom Applicability")
+
         readme = pd.DataFrame(
             [
-                {"Field": "Logic", "Value": "Rows are matched by Report event = triggerOrContext."},
+                {
+                    "Field": "Logic",
+                    "Value": "Rows are matched by reference trigger column = logs triggerOrContext. The reference trigger can be Report event or Upload condition.",
+                },
+                {
+                    "Field": "Reference trigger aliases",
+                    "Value": "Accepted reference columns: Report event, Upload condition. Internally both are normalized to Report event.",
+                },
                 {
                     "Field": "Signal match",
                     "Value": "Signal is searched only inside JSON data keys, using deterministic aliases from Signal long name / Signal name / Signal short name.",
@@ -472,6 +897,10 @@ def write_output(
                 {
                     "Field": "DBB support",
                     "Value": "If triggerOrContext column is missing, it is extracted automatically from JSON message payload (context.triggerOrContext, data.trigger, data.standardTrigger).",
+                },
+                {
+                    "Field": "Custom applicability",
+                    "Value": "Custom XML/CSV is treated as the applicability reference for the exact car. Every Custom row is exported. The first field in Custom Name is Signal Short Name. Matching to Summary/CCS uses Signal short name. Custom trigger is displayed and used only to prefer the same Summary trigger when available; it never rejects applicability.",
                 },
             ]
         )
@@ -520,6 +949,21 @@ def auto_format_excel(output_path: Path) -> None:
                         elif cell.value == "SIGNAL NOT FOUND":
                             cell.fill = warn_fill
                         elif cell.value == "TRIGGER NOT FOUND":
+                            cell.fill = missing_fill
+
+            if ws.title == "Custom Applicability":
+                headers = {cell.value: idx + 1 for idx, cell in enumerate(ws[1])}
+                status_col = headers.get("Status") or headers.get("Custom Applicability Status")
+
+                if status_col:
+                    for row in range(2, ws.max_row + 1):
+                        cell = ws.cell(row=row, column=status_col)
+                        text_value = "" if cell.value is None else str(cell.value)
+                        if "PRESENT IN SUMMARY" in text_value:
+                            cell.fill = found_fill
+                        elif "SIGNAL NOT PRESENT" in text_value or "TRIGGER NOT PRESENT" in text_value:
+                            cell.fill = warn_fill
+                        else:
                             cell.fill = missing_fill
 
         wb.save(output_path)

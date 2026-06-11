@@ -57,6 +57,7 @@ class SignalCheckerModernUI(ctk.CTk):
 
         self.reference_path_var = ctk.StringVar()
         self.logs_path_var = ctk.StringVar()
+        self.custom_path_var = ctk.StringVar()
         self.output_path_var = ctk.StringVar()
         self.export_debug_var = ctk.BooleanVar(value=True)
         self.default_export_debug_var = ctk.BooleanVar(value=True)
@@ -157,7 +158,7 @@ class SignalCheckerModernUI(ctk.CTk):
 
         ctk.CTkLabel(
             sidebar,
-            text="V.2.1.0-STABLE",
+            text="V.3.0.1 - Signal Analysis Interface - With CustomSettings",
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color=TEXT_MUTED,
         ).grid(row=1, column=0, sticky="w", padx=24, pady=(0, 20))
@@ -499,6 +500,7 @@ class SignalCheckerModernUI(ctk.CTk):
         for key, title in [
             ("reference", "Reference file"),
             ("logs", "Logs file"),
+            ("custom", "Custom applicability file"),
             ("output", "Output Excel"),
         ]:
             frame = ctk.CTkFrame(card, fg_color=SURFACE_LOW, corner_radius=14)
@@ -832,9 +834,10 @@ class SignalCheckerModernUI(ctk.CTk):
             text_color=TEXT,
         ).grid(row=0, column=0, sticky="w", padx=18, pady=(16, 12))
 
-        self._file_row(file_card, 1, "Reference file (CCS)", self.reference_path_var, self.load_reference, "BROWSE")
-        self._file_row(file_card, 2, "Logs file (UU)", self.logs_path_var, self.load_logs, "BROWSE")
-        self._file_row(file_card, 3, "Output Excel", self.output_path_var, self.choose_output, "SAVE AS")
+        self._file_row(file_card, 1, "Reference file (CCS base)", self.reference_path_var, self.load_reference, "BROWSE")
+        self._file_row(file_card, 2, "Logs file (CDP / vehicle)", self.logs_path_var, self.load_logs, "BROWSE")
+        self._file_row(file_card, 3, "Custom applicability file", self.custom_path_var, self.choose_custom, "BROWSE")
+        self._file_row(file_card, 4, "Output Excel", self.output_path_var, self.choose_output, "SAVE AS")
 
         # Options
         options_card = ctk.CTkFrame(row, fg_color=SURFACE, corner_radius=16)
@@ -1047,8 +1050,9 @@ class SignalCheckerModernUI(ctk.CTk):
             "Workflow:\n\n"
             "1. Load Reference file\n"
             "2. Load Logs file\n"
-            "3. Choose output Excel path\n"
-            "4. Press RUN CHECK\n\n"
+            "3. Load Custom applicability file XML/CSV, if available\n"
+            "4. Choose output Excel path\n"
+            "5. Press RUN CHECK\n\n"
             "Use Dashboard for overview, Live Stream for console monitoring, "
             "File Explorer for opening paths, and Settings for preferences."
         )
@@ -1144,6 +1148,8 @@ class SignalCheckerModernUI(ctk.CTk):
             return self.reference_path_var.get().strip()
         if key == "logs":
             return self.logs_path_var.get().strip()
+        if key == "custom":
+            return self.custom_path_var.get().strip()
         if key == "output":
             return self.output_path_var.get().strip()
         return ""
@@ -1240,6 +1246,7 @@ class SignalCheckerModernUI(ctk.CTk):
     def _update_options_info(self) -> None:
         ref_name = Path(self.reference_path_var.get()).name if self.reference_path_var.get().strip() else "Not loaded"
         log_name = Path(self.logs_path_var.get()).name if self.logs_path_var.get().strip() else "Not loaded"
+        custom_name = Path(self.custom_path_var.get()).name if self.custom_path_var.get().strip() else "Not selected"
         out_name = Path(self.output_path_var.get()).name if self.output_path_var.get().strip() else "Not selected"
         debug_state = "ON" if self.export_debug_var.get() else "OFF"
 
@@ -1247,9 +1254,10 @@ class SignalCheckerModernUI(ctk.CTk):
             "Ready for deep-scan analysis.\n\n"
             f"Reference: {ref_name}\n"
             f"Logs: {log_name}\n"
+            f"Custom applicability: {custom_name}\n"
             f"Output: {out_name}\n"
             f"Debug Export: {debug_state}\n\n"
-            "Ensure paths are correct and the output location is write-accessible before execution."
+            "Custom XML/CSV is optional. When selected, it is treated as the applicability reference for the exact car."
         )
 
         self.options_info_box.configure(state="normal")
@@ -1261,6 +1269,7 @@ class SignalCheckerModernUI(ctk.CTk):
         mapping = {
             "reference": self.reference_path_var.get().strip(),
             "logs": self.logs_path_var.get().strip(),
+            "custom": self.custom_path_var.get().strip(),
             "output": self.output_path_var.get().strip(),
         }
 
@@ -1283,6 +1292,7 @@ class SignalCheckerModernUI(ctk.CTk):
             "",
             f"Reference rows: {self.reference_rows_var.get()}",
             f"Log rows: {self.logs_rows_var.get()}",
+            f"Custom applicability: {Path(self.custom_path_var.get()).name if self.custom_path_var.get().strip() else 'Not selected'}",
             f"Eligible signals: {self.eligible_signals_var.get()}",
             f"Last output: {self.last_output_var.get()}",
         ]
@@ -1343,6 +1353,17 @@ class SignalCheckerModernUI(ctk.CTk):
         self._log(f"Logs file loaded: {path}")
         self.refresh_all_views()
 
+    def choose_custom(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Choose Custom applicability file",
+            filetypes=[("Supported", "*.xml *.csv *.xlsx *.xls *.xlsm *.tsv"), ("All files", "*.*")],
+        )
+        if path:
+            self.custom_path_var.set(path)
+            self._set_status(f"Loaded custom applicability reference: {Path(path).name}")
+            self._log(f"Custom applicability file selected: {path}")
+            self.refresh_all_views()
+
     def choose_output(self) -> None:
         path = filedialog.asksaveasfilename(
             title="Choose output file",
@@ -1368,6 +1389,7 @@ class SignalCheckerModernUI(ctk.CTk):
 
         self.reference_path_var.set("")
         self.logs_path_var.set("")
+        self.custom_path_var.set("")
         self.output_path_var.set("")
         self.export_debug_var.set(self.default_export_debug_var.get())
 
@@ -1402,6 +1424,7 @@ class SignalCheckerModernUI(ctk.CTk):
             logs_path=self.logs_path_var.get().strip(),
             output_path=output_path,
             export_debug=self.export_debug_var.get(),
+            custom_path=self.custom_path_var.get().strip() or None,
         )
 
     def run_in_thread(self) -> None:
